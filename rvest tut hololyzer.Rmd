@@ -1,0 +1,176 @@
+---
+title: "Tutorial: Scraping Hololyzer with R and rvest"
+author: "Watson Li"
+date: "2024-03-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## A brief intro to Web Scraping with rvest
+
+Today, we'll be taking a look at how to use R, and specifically, the `tidyverse` and `rvest` packages, to scrape the web for information. We'll be taking a look at some relatively basic sites built primarily with HTML, with minimal scripting; to scrape sites that are dynamically loaded via JavaScript, you'd typically want to use a more advanced tool like `RSelenium`, which actually uses a browser to load pages.
+
+Let's begin by loading up the packages we'll need today. We'll be using the Tidyverse package, a collection of packages that work well together for R projects involving data manipulation and visualization. Packages included in the Tidyverse that we're particularly interested in today are `dplyr` and `magrittr`. `dplyr` is a package that provides a data manipulation tools, such as the `mutate()` and `filter()` functions, while `magrittr` provides the `%>%` operator, which allows for a more readable way to chain functions together. `rvest` is a package that allows us to load HTML webpages and parse them using CSS selectors to scrape the web for information.
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(rvest)
+```
+
+The website we'll be scraping data from today is called Hololyzer, a Hololive fansite that collects data about memberships and superchats on individual youtube streams. We'll be writing a scraper capable of taking in any Hololyzer stream archive URL, and gathering data pertaining to superchats from that specific stream, more specifically superchat values in their original currency and converted to JPY, the name of the youtube account that bought the superchat, and any message they may have attached to their superchat. 
+
+To be entirely honest, the further I went into the HTML for this page, the more I regretted choosing it, as the site is a project that's a bit of a mess due to being a fairly janky site built by fans. Additionally, while the site is given in mostly basic HTML, there's a lot of nested elements even within the table itself that make it a bit of a pain to scrape. However, we'll make do with what we have! Let's begin by declaring and setting our URL variable to the page we want to scrape.
+
+```{r}
+url <- "https://www.hololyzer.net/youtube/archive/superchat/11UEzE5K3XQ.html"
+```
+
+Now, we'll need to tell R to read the HTML of the page we're interested in by calling the `read_html()` function from the `rvest` package.
+
+```{r}
+page <- read_html(url)
+```
+
+Great! If you're running this block by block in Rstudio, you should now see in your Environment panel to the right that `page` now contains the HTML of the page we're interested in. 
+
+We're going to start by selecting all nodes with the html class "visible" within the node with the id "chatarea". The reason for this is due to the fact that the superchat data we're interested in is contained within these nodes -  the only HTML classes on the page that contain "visible" are those defining rows of the main table.  There are some nodes that are hidden, and we don't want to scrape those; those are the nodes containing information about membership purchases and membership renewals; we're only interested in superchats.
+
+```{r}
+superchats <- html_nodes(page, "#chatarea .visible")
+```
+
+Now we're going to call the `map_df` function from the `purrr` package in the tidyverse, which will allow us to iterate over each element in the superchats variable, and return a data frame with the results of the operations we're defining within. Here comes the horrifically messy bit! We'll be using the pipe from `magrittr` to improve legibility within the function itself by saving on variable reassignments a couple times. 
+
+Note that the website we're scraping from has quite a bit of HTML, so I won't be explaining the entirety of the page, but if you'd like to follow along, feel free to go to the link declared in the URL variable above and inspect the page yourself! In a browser of your choice, navigate down to each element in the table you're interested in, right-click, and select "Inspect Element" to see the HTML responsible for that part of the page - for our purposes, we're particularly interested in the `class` attributes of the elements we're scraping.
+
+```{r}
+superchats <- map_df(superchats, function(node) {
+    
+    # We'll start with extracting the superchat values. Note that the page is somewhat problematic here:
+    # If the original superchat value was in Yen, this cell contains only one value, in Yen, which is left-aligned;
+    # However, if the original superchat was in another currency, the cell contains two values, the original value
+    # and the value in Yen, which is right-aligned. We'll need to account for this.
+    
+    value = html_text(html_nodes(node, ".table-cell.align-left"))
+    
+    # If there's a right-aligned value in the cell, we'll extract it and convert it to a numeric value. Any right-aligned
+    # value has to be in Yen, so we won't need a currency conversion for it.
+    
+    yen_value = html_text(html_nodes(node, ".table-cell.align-right")) %>%
+      
+      # We'll use the str_remove_all function from the stringr package to remove anything that won't leave behind just a number.
+      # We can do this by passing the function a short regex pattern that matches any character that isn't a number or a period.
+      
+      str_remove_all("[^0-9.]") %>%
+      
+      # and now we'll just force the conversion to a numeric value.
+      
+      as.numeric()
+    
+    # If the yen_value variable is equal to NA, that means that there wasn't a right-aligned value in the cell, implying
+    # that the superchat was originally in Yen, which further implies that the value variable was already in yen
+    # and we don't need to convert it. If that's the case, we'll just convert the value variable to a numeric value,
+    # just like we did with yen_value.
+    
+    yen = ifelse(is.na(yen_value), str_remove_all(value, "[^0-9.]") %>% 
+                   as.numeric(), yen_value)
+    
+    # Next, we'll extract the name of the user who sent the superchat. This is a simple operation, as the name is always
+    # left-aligned in its cell. However, this will also scrape an excessive number of nodes, as several elements aside from the
+    # usernames are also left-aligned. We'll need to account for this later.
+    
+    user = html_text(html_nodes(node, ".align-left"))
+    
+    # The final piece of information we're interested in is the comment attached to the superchat. This was another of the more
+    # problematic parts of the page, as the when the superchat contained no comment, the cell contains a nested element
+    # that shows up in English as "(wordless superchat)" in small blue text. We'll need to account for this with 
+    # an ifelse statement, where we check if the nested element is present, and if it is, extract the text from it.
+    # If it isn't there, we'll just extract the text from the cell itself.
+    
+    comment = ifelse(!is.na(html_node(node, ".td.align-left.comment span")),
+                     html_text(html_node(node, ".td.align-left.comment span")),
+                     html_text(html_node(node, ".td.align-left.comment")))
+    
+    # Finally, we'll return a list containing the values we've extracted from the node/row we performed our operations on.
+    
+    list(value = value, yen = yen, user = user, comment = comment)
+  })
+```
+
+While that *should* have taken care of all the superchat rows, the table also contains a lot of edge cases, with special characters, custom emotes inside more nested elements that link to images, and so on. This would have been too complex to account for in our initial operations, so we'll take care of them now, beginning by dropping any rows that contain NA values.
+```{r}
+superchats <- drop_na(superchats)
+```
+  
+We now find that each value has been split into three repeated rows, thanks to the way the username scraping was implemented above, and the way that the table was structured. We'll need to merge these rows back together. Starting with the third row, let's move every third "user" to the preceding row's "comment" column!
+  
+```{r}  
+superchats <- mutate(superchats, comment = if_else(row_number() %% 3 == 2, lead(if_else(row_number() %% 3 == 0, user, NA_character_)), comment))
+```  
+
+Next, we'll only keep every third row starting from the second row, so as to remove the repeated rows.
+  
+```{r}
+superchats <- filter(superchats, row_number() %% 3 == 2)
+```
+
+Additionally, some users show up more than once. While this can be easily seen on the website itself, the scraped data shows that the repeated occurences have a counter appended to their username. We'll need to strip this counter from the username, which can be done using a short regex to check if the username matches a search pattern, where the `user` string can be a wildcard that ends with a number in parentheses. If it does, we'll remove the counter from the username.
+
+```{r}
+superchats <- mutate(superchats, user = if_else(str_detect(user, "\\(\\d+\\)$"), str_remove(user, "\\(\\d+\\)$"), user))
+```
+
+We'll now need to replace the wordless superchats. By default, it seems the scraped values are in Japanese and say "無言スパチャ", which roughly translates to "silent superchat". Let's replace that with the English we saw on the rendered webpage. 
+
+```{r} 
+superchats <- mutate(superchats, comment = if_else(comment == "(無言スパチャ)", "wordless superchat", comment))
+```  
+  
+Finally, we were unable to scrape the custom emotes, so those have left behind empty strings, but we can at least note that they were emotes.
+  
+```{r}  
+superchats <- mutate(superchats, comment = if_else(comment == "", "Member emote", comment))
+```
+
+Now that we're done with our scraping, let's take a look at the data we've gathered!
+
+```{r}
+print(n = 10, superchats)
+```
+
+Great! Looks like we'll be able to use this data for a wide variety of analyses now, ranging from things as complex as sentiment analysis of the comments to tasks as simple as pulling up specific chats, calculating the total amount of superchats sent during the stream, or just finding the most generous / most frequent superchatter. For example, let's take a look at the first 5 comments from the stream that weren't emote or wordless chats! This time, we'll once again use the pipe from `magrittr` to save space and improve legibility, given that it's only a short operation.
+
+```{r}
+text_comments <- superchats %>%
+  filter(comment != "Member emote" & comment != "wordless superchat") %>%
+  select(comment)
+options(width = max(nchar(as.character(text_comments$comment))))
+print(n = 5, text_comments)
+```
+
+Finally, to close off this demonstration, let's take a look at who the most generous superchatter was during the stream, how much they contributed as a percentage of total superchats for the stream, and if they were our most frequent superchatter as well. We'll do this by creating a new dataframe, `chatter_data`, that contains the number of superchats each user sent, and the total value of superchats they sent. We'll then calculate the total superchat value, and print everything out nicely with a concatenate statement.
+
+```{r}
+chatter_data <- superchats %>%
+  
+  # group by user
+  
+  group_by(user) %>%
+  
+  # count the number of superchats each user sent
+  
+  summarise(superchats = n()) %>%
+  
+  # merge the superchat count with the total yen value of superchats each user sent
+  
+  left_join(superchats %>% group_by(user) %>% summarise(total_yen = sum(yen)), by = "user")
+
+total_superchats <- sum(chatter_data$total_yen)
+
+cat("The most generous superchatter was ", chatter_data$user[which.max(chatter_data$total_yen)], ", who contributed ", max(chatter_data$total_yen), "yen or", round(max(chatter_data$total_yen) / total_superchats * 100, 2), "% of the total superchats for the stream. The most frequent chatter was", chatter_data$user[which.max(chatter_data$superchats)], "with", max(chatter_data$superchats), "superchats.")
+```
+
+There we go! I hope this has been a helpful demonstration both in how to perform web scraping in R, and some simple ways to make use of your scraped data!
